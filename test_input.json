@@ -1,0 +1,9 @@
+{
+  "input": {
+    "prompt": "A cinematic photo of a futuristic black sports car in a neon-lit workshop, dramatic lighting, highly detailed",
+    "width": 512,
+    "height": 512,
+    "steps": 2,
+    "seed": 1985
+  }
+}
