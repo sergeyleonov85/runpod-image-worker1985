@@ -1,93 +1,94 @@
-import base64
-import io
 import os
-import random
-import time
-
-import runpod
+import uuid
+import boto3
 import torch
-from diffusers import AutoPipelineForText2Image
+import runpod
+from diffusers import StableDiffusionXLPipeline
 
-MODEL_ID = os.getenv("MODEL_ID", "stabilityai/sdxl-turbo")
-
-if not torch.cuda.is_available():
-    raise RuntimeError("CUDA GPU is required for this worker.")
+MODEL_ID = os.getenv("MODEL_ID", "stabilityai/stable-diffusion-xl-base-1.0")
 
 print(f"Loading model: {MODEL_ID}")
-
-pipe = AutoPipelineForText2Image.from_pretrained(
+pipe = StableDiffusionXLPipeline.from_pretrained(
     MODEL_ID,
     torch_dtype=torch.float16,
-    variant="fp16",
     use_safetensors=True,
 )
 pipe = pipe.to("cuda")
-pipe.set_progress_bar_config(disable=True)
+pipe.enable_attention_slicing()
+print("Model loaded.")
 
-print("Model loaded successfully.")
+S3_ENDPOINT = os.getenv("S3_ENDPOINT")
+S3_BUCKET = os.getenv("S3_BUCKET")
+S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
+S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
 
+def upload_image(path, key):
+    if not all([S3_ENDPOINT, S3_BUCKET, S3_ACCESS_KEY, S3_SECRET_KEY]):
+        raise RuntimeError(
+            "S3 is not configured. Set S3_ENDPOINT, S3_BUCKET, "
+            "S3_ACCESS_KEY and S3_SECRET_KEY as RunPod secrets/environment variables."
+        )
 
-def _validate_dimension(value, name):
-    value = int(value)
-    if value < 256 or value > 1024 or value % 64 != 0:
-        raise ValueError(f"{name} must be between 256 and 1024 and divisible by 64.")
-    return value
+    s3 = boto3.client(
+        "s3",
+        endpoint_url=S3_ENDPOINT,
+        aws_access_key_id=S3_ACCESS_KEY,
+        aws_secret_access_key=S3_SECRET_KEY,
+        region_name="us-ca-2",
+    )
+    s3.upload_file(path, S3_BUCKET, key, ExtraArgs={"ContentType": "image/png"})
 
+    # RunPod S3-compatible storage may not expose objects publicly.
+    # Return the object coordinates so the next integration layer can fetch/sign it.
+    return {
+        "bucket": S3_BUCKET,
+        "key": key,
+        "endpoint": S3_ENDPOINT,
+    }
 
 def handler(event):
     inp = event.get("input", {})
-    prompt = str(inp.get("prompt", "")).strip()
-
+    prompt = inp.get("prompt")
     if not prompt:
         return {"error": "input.prompt is required"}
 
+    width = int(inp.get("width", 512))
+    height = int(inp.get("height", 512))
+    steps = int(inp.get("steps", 20))
+    seed = int(inp.get("seed", 1985))
+    guidance = float(inp.get("guidance_scale", 7.0))
+
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+
+    image = pipe(
+        prompt=prompt,
+        width=width,
+        height=height,
+        num_inference_steps=steps,
+        guidance_scale=guidance,
+        generator=generator,
+    ).images[0]
+
+    filename = f"{uuid.uuid4().hex}.png"
+    local_path = f"/tmp/{filename}"
+    image.save(local_path, format="PNG")
+
     try:
-        width = _validate_dimension(inp.get("width", 512), "width")
-        height = _validate_dimension(inp.get("height", 512), "height")
+        obj = upload_image(local_path, f"generated/{filename}")
+    finally:
+        try:
+            os.remove(local_path)
+        except OSError:
+            pass
 
-        steps = int(inp.get("steps", 2))
-        if steps < 1 or steps > 4:
-            raise ValueError("steps must be between 1 and 4 for SDXL-Turbo.")
-
-        seed = int(inp.get("seed", random.randint(0, 2**31 - 1)))
-        if seed < 0:
-            raise ValueError("seed must be >= 0")
-
-        generator = torch.Generator(device="cuda").manual_seed(seed)
-
-        started = time.perf_counter()
-
-        with torch.inference_mode():
-            image = pipe(
-                prompt=prompt,
-                width=width,
-                height=height,
-                num_inference_steps=steps,
-                guidance_scale=0.0,
-                generator=generator,
-            ).images[0]
-
-        elapsed = time.perf_counter() - started
-
-        buf = io.BytesIO()
-        image.save(buf, format="PNG", optimize=True)
-        image_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
-
-        return {
-            "image": f"data:image/png;base64,{image_b64}",
-            "seed": seed,
-            "width": width,
-            "height": height,
-            "steps": steps,
-            "model": MODEL_ID,
-            "generation_time_seconds": round(elapsed, 3),
-        }
-
-    except Exception as exc:
-        return {
-            "error": str(exc),
-            "type": exc.__class__.__name__,
-        }
-
+    return {
+        "status": "ok",
+        "image": obj,
+        "seed": seed,
+        "width": width,
+        "height": height,
+        "steps": steps,
+        "model": MODEL_ID,
+    }
 
 runpod.serverless.start({"handler": handler})
